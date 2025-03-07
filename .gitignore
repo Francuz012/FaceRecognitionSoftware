@@ -1,3 +1,5 @@
 #No need to have the database in the GIT
 LFW/
 widerface/
+preprocessed_data/
+augmented_data/
