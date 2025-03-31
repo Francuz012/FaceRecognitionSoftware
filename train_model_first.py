@@ -1,75 +1,67 @@
 #!/usr/bin/env python
-"""
-Training Script for Face Detection Model
-
-Purpose:
-    - Defines the model architecture (imported from a shared module).
-    - Runs the training loop: computing training and validation losses,
-      backpropagation, and optimizer updates.
-    - Logs performance metrics per epoch.
-    - Saves checkpoints (both latest and best model based on validation loss).
-    
-Note:
-    - The inference/test script uses the same model architecture (imported from define_model)
-      and loads checkpoints for face detection and visualization.
-    - Training and inference responsibilities are kept separate to avoid redundancy.
-"""
-
 import os
 import json
 import cv2
 import torch
+import random
 import numpy as np
 
 from torch.utils.data import Dataset, DataLoader, random_split
-from torch import optim
+from torch import nn, optim
 
-# Import shared modules for model and loss to ensure consistency with inference
-from define_model import FaceDetectionModel  # Contains the FaceDetector architecture.
-from define_loss import FaceDetectionLoss   # Contains the loss function used for training.
+# Import your model and loss from previous steps
+from define_model import FaceDetectionModel
+from define_loss import FaceDetectionLoss
 
 # -------------------------------------------------------------------
 # CONFIGURATION
 # -------------------------------------------------------------------
-DATA_DIR = "./augmented_data/train"  # Path to training images
+# Point to your augmented dataset
+DATA_DIR = "./augmented_data/train"
 ANNOTATIONS_FILE = os.path.join(DATA_DIR, "train_annotations_augmented.json")
 
+# Training parameters
 BATCH_SIZE = 16
 NUM_EPOCHS = 25
 LEARNING_RATE = 1e-3
-VAL_SPLIT = 0.1    # Use 10% of data for validation
+VAL_SPLIT = 0.1   # 10% of data for validation
 CHECKPOINT_DIR = "./checkpoints"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-INPUT_SIZE = 256   # Image size expected by the model
+
+# Image size must match the input size of your model
+INPUT_SIZE = 256
 
 # -------------------------------------------------------------------
 # DATASET DEFINITION
 # -------------------------------------------------------------------
 class FaceDataset(Dataset):
     """
-    Custom Dataset for Face Detection.
-    Loads images and their corresponding bounding box annotations.
-    
-    Each sample:
-        - Loads image from DATA_DIR.
-        - Reads the corresponding bounding box from the annotations JSON.
-        - Sets a classification label (1.0 if a face is present, else 0.0).
-        - Uses only the first bounding box if multiple exist.
+    A simple Dataset class that:
+      - Loads images from DATA_DIR.
+      - Uses a JSON file with bounding boxes for each image.
+      - For each image:
+         * Classification label is 1 if there's at least one bounding box, else 0.
+         * If multiple bounding boxes exist, we only use the first one.
     """
     def __init__(self, data_dir, annotations_file):
         super().__init__()
         self.data_dir = data_dir
+        
+        # Load annotations from JSON
         with open(annotations_file, 'r', encoding='utf-8') as f:
             self.annotations = json.load(f)
         
+        # Build a list of samples: (image_rel_path, label, first_box)
         self.samples = []
         for rel_path, boxes in self.annotations.items():
             if len(boxes) > 0:
-                box = boxes[0]  # Use the first bounding box
-                label = 1.0    # Face present
+                # Use the first bounding box
+                box = boxes[0]
+                label = 1.0  # face present
             else:
                 box = {'x': 0, 'y': 0, 'width': 0, 'height': 0}
-                label = 0.0    # No face
+                label = 0.0  # no face
+            
             self.samples.append((rel_path, label, box))
     
     def __len__(self):
@@ -77,26 +69,31 @@ class FaceDataset(Dataset):
     
     def __getitem__(self, idx):
         rel_path, label, box = self.samples[idx]
+        
         img_path = os.path.join(self.data_dir, rel_path)
         image = cv2.imread(img_path)
         if image is None:
+            # If the image can't be loaded, return a dummy image
             image = np.zeros((INPUT_SIZE, INPUT_SIZE, 3), dtype=np.uint8)
         
-        # Convert BGR to RGB
+        # Convert BGR -> RGB
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        # Normalize and convert to float [0,1]
+        
+        # Normalize to [0,1] float
         image = image.astype(np.float32) / 255.0
-        # Rearrange dimensions (H, W, C) -> (C, H, W)
+        
+        # (H, W, C) -> (C, H, W)
         image = np.transpose(image, (2, 0, 1))
         
+        # Convert to tensors
         image_tensor = torch.tensor(image, dtype=torch.float)
-        class_label = torch.tensor([label], dtype=torch.float)
+        class_label = torch.tensor([label], dtype=torch.float)  # shape [1]
         bbox_label = torch.tensor([box['x'], box['y'], box['width'], box['height']], dtype=torch.float)
         
         return image_tensor, class_label, bbox_label
 
 # -------------------------------------------------------------------
-# TRAINING & VALIDATION FUNCTIONS
+# TRAINING & VALIDATION LOOP
 # -------------------------------------------------------------------
 def train_one_epoch(model, dataloader, loss_fn, optimizer, device):
     model.train()
@@ -108,9 +105,11 @@ def train_one_epoch(model, dataloader, loss_fn, optimizer, device):
         
         optimizer.zero_grad()
         class_pred, bbox_pred = model(images)
-        total_loss, _, _ = loss_fn(class_pred, class_labels, bbox_pred, bbox_labels)
+        
+        total_loss, c_loss, b_loss = loss_fn(class_pred, class_labels, bbox_pred, bbox_labels)
         total_loss.backward()
         optimizer.step()
+        
         running_loss += total_loss.item()
     
     return running_loss / len(dataloader)
@@ -125,7 +124,8 @@ def validate_one_epoch(model, dataloader, loss_fn, device):
             bbox_labels = bbox_labels.to(device)
             
             class_pred, bbox_pred = model(images)
-            total_loss, _, _ = loss_fn(class_pred, class_labels, bbox_pred, bbox_labels)
+            total_loss, c_loss, b_loss = loss_fn(class_pred, class_labels, bbox_pred, bbox_labels)
+            
             running_loss += total_loss.item()
     
     return running_loss / len(dataloader)
@@ -134,7 +134,7 @@ def validate_one_epoch(model, dataloader, loss_fn, device):
 # MAIN TRAINING SCRIPT
 # -------------------------------------------------------------------
 def main():
-    # Verify the annotations file exists.
+    # 1. Prepare Dataset
     if not os.path.exists(ANNOTATIONS_FILE):
         print(f"Annotations file not found: {ANNOTATIONS_FILE}")
         return
@@ -144,7 +144,7 @@ def main():
         print("No data found in the dataset.")
         return
     
-    # Split dataset into training and validation sets.
+    # 2. Split into train/val
     val_size = int(len(dataset) * VAL_SPLIT)
     train_size = len(dataset) - val_size
     train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
@@ -154,56 +154,50 @@ def main():
     
     print(f"Training samples: {len(train_dataset)}, Validation samples: {len(val_dataset)}")
     
-    # Initialize model, loss function, optimizer, and learning rate scheduler.
+    # 3. Initialize Model, Loss, Optimizer
     model = FaceDetectionModel(num_classes=1, input_size=INPUT_SIZE).to(DEVICE)
     loss_fn = FaceDetectionLoss(lambda_reg=1.0).to(DEVICE)
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=2, verbose=True
-    )
     
+    # Create checkpoint directory if it doesn't exist
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     latest_ckpt_path = os.path.join(CHECKPOINT_DIR, "latest_checkpoint.pth")
     
-    # Check if a checkpoint exists to resume training.
+    # 4. Check if there's a checkpoint to resume from
     start_epoch = 0
     best_val_loss = float("inf")
+    
     if os.path.exists(latest_ckpt_path):
-        print(f"Resuming from checkpoint: {latest_ckpt_path}")
+        print(f"Resuming from {latest_ckpt_path}")
         checkpoint = torch.load(latest_ckpt_path, map_location=DEVICE)
+        
         model.load_state_dict(checkpoint["model_state"])
         optimizer.load_state_dict(checkpoint["optimizer_state"])
-        if "scheduler_state" in checkpoint:
-            scheduler.load_state_dict(checkpoint["scheduler_state"])
-        start_epoch = checkpoint["epoch"] + 1
+        
+        start_epoch = checkpoint["epoch"] + 1  # continue from the next epoch
         best_val_loss = checkpoint["best_val_loss"]
-        print(f"Resumed from epoch {start_epoch} with best validation loss: {best_val_loss:.4f}")
+        print(f"  Resumed from epoch {start_epoch}, best_val_loss so far: {best_val_loss:.4f}")
     else:
-        print("No previous checkpoint found. Starting training from scratch.")
+        print("No previous checkpoint found. Starting from scratch.")
     
-    # Main training loop.
+    # 5. Training Loop
     for epoch in range(start_epoch, NUM_EPOCHS):
         train_loss = train_one_epoch(model, train_loader, loss_fn, optimizer, DEVICE)
         val_loss   = validate_one_epoch(model, val_loader, loss_fn, DEVICE)
         
-        print(f"Epoch [{epoch+1}/{NUM_EPOCHS}] | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
+        print(f"Epoch [{epoch+1}/{NUM_EPOCHS}] | "
+              f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
         
-        # Update learning rate based on validation loss.
-        scheduler.step(val_loss)
-        current_lr = optimizer.param_groups[0]['lr']
-        print(f"  Adjusted Learning Rate: {current_lr:.6f}")
-        
-        # Save the latest checkpoint.
+        # Always save the 'latest_checkpoint.pth' so we can resume from here
         checkpoint_data = {
             "epoch": epoch,
             "model_state": model.state_dict(),
             "optimizer_state": optimizer.state_dict(),
-            "scheduler_state": scheduler.state_dict(),
             "best_val_loss": best_val_loss
         }
         torch.save(checkpoint_data, latest_ckpt_path)
         
-        # Save a checkpoint if this epoch yields the best validation loss so far.
+        # Also save a "best model" checkpoint if this is the best so far
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_ckpt_path = os.path.join(CHECKPOINT_DIR, f"best_model_epoch_{epoch+1}.pth")
@@ -211,10 +205,9 @@ def main():
                 "epoch": epoch,
                 "model_state": model.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
-                "scheduler_state": scheduler.state_dict(),
                 "best_val_loss": best_val_loss
             }, best_ckpt_path)
-            print(f"  New best model saved to: {best_ckpt_path}")
+            print(f"  Best model so far. Saved to {best_ckpt_path}")
     
     print("\nTraining complete.")
 
